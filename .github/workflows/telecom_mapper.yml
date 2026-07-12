@@ -29,10 +29,11 @@ jobs:
       - name: تشغيل السكربت
         run: timeout 20400 python3 telecom_network_mapper.py || true
 
-      - name: حفظ النتائج في المستودع
+      - name: حفظ النتائج في المستودع (commit + push)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          touch telecom_networks.json checkpoint.json
           git add telecom_networks.json checkpoint.json
           if git diff --cached --quiet; then
             echo "لا تغييرات جديدة لحفظها."
