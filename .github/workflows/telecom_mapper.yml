@@ -1,0 +1,42 @@
+name: Telecom Network Mapper
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: telecom-mapper
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: سحب المستودع
+        uses: actions/checkout@v4
+
+      - name: تجهيز Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: تشغيل السكربت
+        run: timeout 20400 python3 telecom_network_mapper.py || true
+
+      - name: حفظ النتائج في المستودع
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add telecom_networks.json checkpoint.json
+          if git diff --cached --quiet; then
+            echo "لا تغييرات جديدة لحفظها."
+          else
+            git commit -m "تحديث تلقائي لنتائج telecom_network_mapper [skip ci]"
+            git push
+          fi
