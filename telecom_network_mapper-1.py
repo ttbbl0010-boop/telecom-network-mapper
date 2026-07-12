@@ -46,6 +46,7 @@ telecom_network_mapper.py
 import ipaddress
 import json
 import os
+import signal
 import socket
 import sys
 import threading
@@ -84,6 +85,18 @@ DNS_MAX_CONCURRENT = 40        # مجمّع خيوط PTR المشترك عالم
 
 _ripestat_semaphore = threading.Semaphore(RIPESTAT_MAX_CONCURRENT)
 DNS_EXECUTOR = ThreadPoolExecutor(max_workers=DNS_MAX_CONCURRENT)
+
+class _GracefulShutdown(Exception):
+    """يُحوّل SIGTERM (المُرسَل مثلًا من أمر timeout في سطر الأوامر، أو من
+    منصات استضافة تُلغي المهمة) إلى استثناء قابل للالتقاط تمامًا مثل Ctrl+C،
+    حتى تُحفظ النتائج دائمًا قبل إنهاء العملية بدل ضياعها بصمت."""
+
+
+def _handle_termination_signal(signum, frame):
+    raise _GracefulShutdown()
+
+
+signal.signal(signal.SIGTERM, _handle_termination_signal)
 
 # =======================================================================
 # 2) المناطق والدول (رموز ISO 3166-1 alpha-2)
@@ -544,8 +557,14 @@ def process_country(cc):
 # =======================================================================
 def load_checkpoint():
     if os.path.exists(CHECKPOINT_PATH):
-        with open(CHECKPOINT_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(CHECKPOINT_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data.get("done_countries"), list):
+                return data
+        except (json.JSONDecodeError, OSError, AttributeError) as e:
+            print(f"تحذير: تعذّرت قراءة {CHECKPOINT_PATH} الموجود ({e})، سيُعاد إنشاؤه.",
+                  file=sys.stderr)
     return {"done_countries": []}
 
 
@@ -598,6 +617,12 @@ def main():
     state = load_checkpoint()
     done = set(state["done_countries"])
     results = load_existing_results()
+
+    # حفظ فوري: يضمن وجود telecom_networks.json وcheckpoint.json على القرص
+    # من أول ثانية، حتى لو حدث خطأ غير متوقع لاحقًا (مهم لخطوة commit/push
+    # في GitHub Actions التي تعتمد على وجود هذين الملفين).
+    save_checkpoint(state)
+    save_results(results)
 
     regions_to_process = {
         r: c for r, c in REGIONS.items() if not ONLY_REGIONS or r in ONLY_REGIONS
@@ -658,13 +683,15 @@ def main():
                 future.result()
             except Exception as e:
                 print(f"    ! خطأ في معالجة {cname} ({cc}): {e}", file=sys.stderr)
-    except KeyboardInterrupt:
-        print("\nتم الإيقاف يدويًا. سيُنهي الخيوط الجارية حاليًا فقط ثم يتوقف "
-              "(التقدم المحفوظ حتى الآن باقٍ - أعد التشغيل للاستئناف).")
+    except (KeyboardInterrupt, _GracefulShutdown) as e:
+        reason = "Ctrl+C يدوي" if isinstance(e, KeyboardInterrupt) else "إشارة إنهاء خارجية (SIGTERM، غالبًا timeout)"
+        print(f"\nتوقف ({reason}). سيُنهي الخيوط الجارية حاليًا فقط ثم يحفظ التقدم "
+              "(أعد تشغيل السكربت لاحقًا للاستئناف).")
         executor.shutdown(wait=True, cancel_futures=True)
     else:
         executor.shutdown(wait=True)
     finally:
+        save_checkpoint(state)
         save_results(results)
         DNS_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
