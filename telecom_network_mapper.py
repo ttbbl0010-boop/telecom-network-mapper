@@ -73,7 +73,8 @@ ONLY_REGIONS = None        # مثال: ["Central Asia", "Southeast Asia"]
 USE_REVERSE_DNS = True     # تعطيله كليًا = اعتماد على RIR فقط (الأسرع)
 RDNS_MODE = "only_if_unclear"   # "always" | "only_if_unclear" | "never"
 RDNS_SAMPLES = 5
-RDNS_TIMEOUT = 2           # ثانية لكل استعلام PTR
+RDNS_TIMEOUT = 2           # ثانية لكل استعلام PTR (best-effort فقط، غير مضمون الالتزام به داخليًا)
+RDNS_BATCH_TIMEOUT = 4     # ثانية: سقف صارم فعلي لكل دفعة عيّنات كتلة واحدة (راجع classify_from_rdns)
 
 LARGE_IPV4_PREFIXLEN = 15  # /15 فأكبر (IPv4) = "كبيرة جدًا" لملاحظة أولوية فقط
 
@@ -86,17 +87,22 @@ DNS_MAX_CONCURRENT = 40        # مجمّع خيوط PTR المشترك عالم
 _ripestat_semaphore = threading.Semaphore(RIPESTAT_MAX_CONCURRENT)
 DNS_EXECUTOR = ThreadPoolExecutor(max_workers=DNS_MAX_CONCURRENT)
 
-class _GracefulShutdown(Exception):
-    """يُحوّل SIGTERM (المُرسَل مثلًا من أمر timeout في سطر الأوامر، أو من
-    منصات استضافة تُلغي المهمة) إلى استثناء قابل للالتقاط تمامًا مثل Ctrl+C،
-    حتى تُحفظ النتائج دائمًا قبل إنهاء العملية بدل ضياعها بصمت."""
+# علم مشترك بين كل الخيوط (الرئيسي والداخلية) لطلب إيقاف لطيف وسريع.
+# مهم: الإشارات (signal) في بايثون تصل للخيط الرئيسي فقط، فالاعتماد على
+# استثناء وحده لا يوقف الخيوط الداخلية (مثل تصنيف مئات الكتل المتبقية
+# لدولة كبيرة) - لذلك كل حلقة عمل (خارجية وداخلية) تفحص هذا العلم بنفسها
+# لتتوقف عن قبول/انتظار عمل جديد فورًا، بدل انتظار كل العمل المتراكم لدولة
+# قد تحوي آلاف الكتل (وهو ما كان يسبب تأخر الإيقاف حتى الحد الأقصى الصارم
+# لمنصة الاستضافة بدل التوقف اللطيف المبكر المقصود).
+SHUTDOWN_EVENT = threading.Event()
 
 
 def _handle_termination_signal(signum, frame):
-    raise _GracefulShutdown()
+    SHUTDOWN_EVENT.set()
 
 
 signal.signal(signal.SIGTERM, _handle_termination_signal)
+signal.signal(signal.SIGINT, _handle_termination_signal)
 
 # =======================================================================
 # 2) المناطق والدول (رموز ISO 3166-1 alpha-2)
@@ -308,17 +314,31 @@ def ip_octets_in_hostname(ip, hostname):
 
 def classify_from_rdns(network_obj):
     """الإشارة الثانية: أنماط PTR. العيّنات الخمس تُفحص بالتوازي عبر DNS_EXECUTOR
-    المشترك عالميًا (لا تمر عبر Semaphore الخاص بـ RIPEstat)."""
+    المشترك عالميًا (لا تمر عبر Semaphore الخاص بـ RIPEstat).
+
+    ⚠️ ملاحظة مهمة: دالة socket.gethostbyaddr في بايثون معروف عنها أنها لا
+    تلتزم دائمًا فعليًا بـ socket.setdefaulttimeout() (قيد موثّق في مكتبة
+    بايثون القياسية، خصوصًا عند عدم وجود سجل PTR أصلًا وهو أمر شائع جدًا).
+    لذلك لا نعتمد على ذلك وحده هنا: نفرض سقفًا زمنيًا صارمًا مستقلًا على
+    الانتظار نفسه عبر as_completed(timeout=...)، فحتى لو عَلِقت بعض
+    الاستعلامات فعليًا في الخلفية، السكربت لا ينتظرها ويكمل بما توفر فقط -
+    هذا ضروري لمنع تعليق التنفيذ بالكامل لساعات عند كتل كثيرة بلا PTR."""
     samples = sample_ips(network_obj, RDNS_SAMPLES)
 
     futures = {DNS_EXECUTOR.submit(reverse_dns_lookup, ip): ip for ip in samples}
     resolved_map = {}
-    for future in as_completed(futures):
-        ip = futures[future]
-        try:
-            resolved_map[ip] = future.result()
-        except Exception:
-            resolved_map[ip] = None
+    try:
+        for future in as_completed(futures, timeout=RDNS_BATCH_TIMEOUT):
+            ip = futures[future]
+            try:
+                resolved_map[ip] = future.result()
+            except Exception:
+                resolved_map[ip] = None
+    except TimeoutError:
+        pass  # بعض العيّنات لم تُكمَل خلال السقف الزمني - نكمل بما توفر فقط
+              # (الاستعلامات العالقة تبقى تعمل بالخلفية دون انتظارها، وهذا
+              # مقبول: بايثون لا يمكنه إنهاء خيط قسرًا، لكن المهم ألا يُعطَّل
+              # تقدّم بقية الكتل بسبب استعلام واحد عالق)
 
     cust_votes = infra_votes = 0
     hostnames_found = []
@@ -478,38 +498,51 @@ def classify_prefix_full(prefix):
 
 def get_telecom_operators_for_country(cc):
     """المرحلة أ: يُرجع [{asn, holder, prefix_list}] لمشغّلي اتصالات الدولة."""
+    if SHUTDOWN_EVENT.is_set():
+        return [], 0
+
     asns = get_country_asns(cc)
     if not asns:
         return [], 0
 
     holders = {}
-    with ThreadPoolExecutor(max_workers=WORKERS_PER_COUNTRY) as executor:
+    executor = ThreadPoolExecutor(max_workers=WORKERS_PER_COUNTRY)
+    try:
         futures = {executor.submit(get_as_holder, asn): asn for asn in asns}
         for future in as_completed(futures):
+            if SHUTDOWN_EVENT.is_set():
+                break
             asn = futures[future]
             try:
                 holders[asn] = future.result()
             except Exception as e:
                 print(f"    ! خطأ AS{asn} (holder): {e}", file=sys.stderr)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     telecom_asns = {asn: holder for asn, holder in holders.items() if is_telecom(holder)}
-    if not telecom_asns:
+    if not telecom_asns or SHUTDOWN_EVENT.is_set():
         return [], len(asns)
 
     prefix_map = {}
-    with ThreadPoolExecutor(max_workers=WORKERS_PER_COUNTRY) as executor:
+    executor = ThreadPoolExecutor(max_workers=WORKERS_PER_COUNTRY)
+    try:
         futures = {executor.submit(get_announced_prefixes, asn): asn for asn in telecom_asns}
         for future in as_completed(futures):
+            if SHUTDOWN_EVENT.is_set():
+                break
             asn = futures[future]
             try:
                 prefix_map[asn] = future.result()
             except Exception as e:
                 print(f"    ! خطأ AS{asn} (prefixes): {e}", file=sys.stderr)
                 prefix_map[asn] = []
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     return (
         [{"asn": asn, "holder": holder, "prefix_list": prefix_map.get(asn, [])}
-         for asn, holder in telecom_asns.items()],
+         for asn, holder in telecom_asns.items() if asn in prefix_map],
         len(asns),
     )
 
@@ -523,17 +556,22 @@ def classify_country_operators(operators):
     ]
 
     results_by_job = {}
-    with ThreadPoolExecutor(max_workers=WORKERS_PER_COUNTRY) as executor:
+    executor = ThreadPoolExecutor(max_workers=WORKERS_PER_COUNTRY)
+    try:
         futures = {
             executor.submit(classify_prefix_full, prefix): (op_idx, prefix)
             for op_idx, prefix in flat_jobs
         }
         for future in as_completed(futures):
+            if SHUTDOWN_EVENT.is_set():
+                break
             op_idx, prefix = futures[future]
             try:
                 results_by_job[(op_idx, prefix)] = future.result()
             except Exception as e:
                 print(f"    ! خطأ تصنيف {prefix}: {e}", file=sys.stderr)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     for op_idx, op in enumerate(operators):
         op["prefixes"] = [
@@ -672,30 +710,31 @@ def main():
             )
 
     executor = ThreadPoolExecutor(max_workers=COUNTRY_WORKERS)
+    warned = False
     try:
         futures = {
             executor.submit(handle_country, region, cc, cname): (region, cc, cname)
             for region, cc, cname in pending
         }
         for future in as_completed(futures):
+            if SHUTDOWN_EVENT.is_set() and not warned:
+                warned = True
+                print("\nطُلب إيقاف (Ctrl+C أو SIGTERM، غالبًا timeout خارجي). الدول قيد "
+                      "التنفيذ الآن ستتوقف عن أي عمل جديد فورًا وتُحفظ نتائجها الجزئية "
+                      "(أعد تشغيل السكربت لاحقًا للاستئناف من حيث توقف).")
             region, cc, cname = futures[future]
             try:
                 future.result()
             except Exception as e:
                 print(f"    ! خطأ في معالجة {cname} ({cc}): {e}", file=sys.stderr)
-    except (KeyboardInterrupt, _GracefulShutdown) as e:
-        reason = "Ctrl+C يدوي" if isinstance(e, KeyboardInterrupt) else "إشارة إنهاء خارجية (SIGTERM، غالبًا timeout)"
-        print(f"\nتوقف ({reason}). سيُنهي الخيوط الجارية حاليًا فقط ثم يحفظ التقدم "
-              "(أعد تشغيل السكربت لاحقًا للاستئناف).")
-        executor.shutdown(wait=True, cancel_futures=True)
-    else:
-        executor.shutdown(wait=True)
     finally:
+        executor.shutdown(wait=not SHUTDOWN_EVENT.is_set(), cancel_futures=True)
         save_checkpoint(state)
         save_results(results)
         DNS_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
-    print(f"\nانتهى. النتائج في: {os.path.abspath(OUTPUT_PATH)}")
+    status = "توقف يدويًا/خارجيًا (تقدّم جزئي محفوظ)" if SHUTDOWN_EVENT.is_set() else "انتهى بالكامل"
+    print(f"\n{status}. النتائج في: {os.path.abspath(OUTPUT_PATH)}")
 
 
 if __name__ == "__main__":
