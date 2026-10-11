@@ -8,7 +8,7 @@
     },
     "classification_method": "دمج نص تسجيل RIR (netname/descr/status) مع أنماط PTR (Reverse DNS، وضع RDNS_MODE=only_if_unclear). تصنيف تخميني وليس مضمونًا 100%، راجع عيّنة يدويًا قبل الاعتماد الكامل عليه.",
     "generated_at": "2026-07-14T07:00:05.778184+00:00",
-    "updated_at": "2026-10-11T04:28:09.610960+00:00"
+    "updated_at": "2026-10-11T12:14:23.490294+00:00"
   },
   "regions": {
     "Southeast Asia": {
